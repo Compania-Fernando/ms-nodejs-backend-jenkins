@@ -4,41 +4,46 @@ pipeline {
     }
 
     environment {
-        APELLIDO = "gavilan" // Cambiar por apellido
-        ACR_NAME = "acrglobalcicd"
-        ACR_LOGIN_SERVER = "${ACR_NAME}.azurecr.io"
-        IMAGE_NAME = "my-nodejs-app-${APELLIDO}"
-        RESOURCE_GROUP = "rg-cicd-terraform-app-baraujo03"
-        AKS_NAME = "aks-dev-eastus"
+        APELLIDO          = "gavilan"
+        ACR_NAME          = "acrglobalcicd"
+        ACR_LOGIN_SERVER  = "${ACR_NAME}.azurecr.io"
+        IMAGE_NAME        = "my-nodejs-app-${APELLIDO}"
+        RESOURCE_GROUP    = "rg-cicd-terraform-app-baraujo03"
+        AKS_NAME_DEV      = "aks-dev-eastus"
+        AKS_NAME_QA       = "aks-qa-eastus"
+        AKS_NAME_PRD      = "aks-prd-eastus"
     }
 
     stages {
 
-        stage('Hello world') {
+        stage('[CI] Instalar dependencias') {
             steps {
-                script { 
-                    // Declarar más variables de entorno
-                    env.VARIABLE = "demo123"
-                }
-                // Primer step
                 sh '''
-                  echo ">>> Impresión Hello world"
-                  echo "Hello world"
-                  echo "Variable declarada en script: $VARIABLE"
-                  echo "Variable declarada en environment: $APELLIDO"
-                '''
-                // Step adicional
-                sh '''
-                  echo ">>> Versiones instaladas:"
-                  node -v
-                  npm -v
-                  docker --version
-                  az version
+                  echo ">>> Instalando dependencias de la aplicación..."
+                  npm install
                 '''
             }
         }
 
-        stage('Azure Login') {
+        stage('[CI] Ejecutar pruebas unitarias') {
+            steps {
+                sh '''
+                  echo ">>> Ejecutando pruebas unitarias..."
+                  npm run test:unit
+                '''
+            }
+        }
+
+        stage('[CI] Ejecutar pruebas de integración') {
+            steps {
+                sh '''
+                  echo ">>> Ejecutando pruebas de integración..."
+                  npm run test:integration
+                '''
+            }
+        }
+
+        stage('[CI] Azure Login') {
             steps {
                 withCredentials([
                     string(credentialsId: 'azure-clientId',       variable: 'AZ_CLIENT_ID'),
@@ -47,7 +52,7 @@ pipeline {
                     string(credentialsId: 'azure-subscriptionId', variable: 'AZ_SUBSCRIPTION_ID')
                 ]) {
                     sh '''
-                      echo ">>> Azure login..."
+                      echo ">>> Iniciando sesión en Azure..."
                       az login --service-principal \
                         --username="$AZ_CLIENT_ID" \
                         --password="$AZ_CLIENT_SECRET" \
@@ -59,19 +64,19 @@ pipeline {
             }
         }
 
-        stage('AKS Credentials') {
+        stage('[CI] AKS Credentials') {
             steps {
                 sh '''
-                  echo ">>> Obteniendo credenciales de AKS..."
+                  echo ">>> Obteniendo credenciales de AKS DEV..."
                   az aks get-credentials \
                     --resource-group $RESOURCE_GROUP \
-                    --name $AKS_NAME \
+                    --name $AKS_NAME_DEV \
                     --overwrite-existing
                 '''
             }
         }
-        
-        stage('[CI] Get Git Commit Short SHA') {
+
+        stage('[CI] Generar ID corto del commit') {
             steps {
                 script {
                     env.IMAGE_TAG = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
@@ -80,13 +85,13 @@ pipeline {
             }
         }
 
-        stage('[CI] Build & Push to ACR') {
+        stage('[CI] Build and Push Docker Image') {
             steps {
                 sh '''
                   echo ">>> Login al ACR..."
                   az acr login --name $ACR_NAME
 
-                  echo ">>> Build de imagen..."
+                  echo ">>> Build de imagen: $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG"
                   docker build -t $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG .
 
                   echo ">>> Push al ACR..."
@@ -95,46 +100,36 @@ pipeline {
             }
         }
 
-        stage('[CD-DEV] Set Image Tag in k8s.yml') {
+        // ─── DEV ────────────────────────────────────────────────────────────────
+
+        stage('[CD-DEV] Deploy a AKS') {
             steps {
-                script { 
-                    // Declarar más variables de entorno
+                script {
                     env.API_PROVIDER_URL = "https://dev.api.com"
                     env.ENV = "dev"
                 }
-
                 sh '''
-                  echo ">>> Renderizando k8s.yml..."
-                  
+                  echo ">>> Renderizando manifiesto para DEV..."
                   envsubst < k8s.yml > k8s-dev.yml
-                  cat k8s-dev.yml
 
+                  echo ">>> Desplegando en AKS DEV..."
+                  az aks command invoke \
+                    --resource-group $RESOURCE_GROUP \
+                    --name $AKS_NAME_DEV \
+                    --command "kubectl apply -f k8s-dev.yml" \
+                    --file k8s-dev.yml
                 '''
             }
         }
 
-        stage('[CD-DEV] Deploy to AKS') {
-          steps {
-            sh '''
-                az aks command invoke \
-                  --resource-group $RESOURCE_GROUP \
-                  --name $AKS_NAME \
-                  --command "kubectl apply -f k8s-dev.yml" \
-                  --file k8s-dev.yml
-
-            '''
-          }
-        }
-        stage('[CD-DEV] Get LoadBalancer IP') {
+        stage('[CD-DEV] Imprimir IP del servicio') {
             steps {
                 sh '''
-                  echo ">>> Intentando obtener IP del LoadBalancer..."
-
-                  SERVICE_NAME="my-nodejs-service-${APELLIDO}-${ENV}"  # Cambia esto por el nombre real de tu Service
+                  SERVICE_NAME="my-nodejs-service-${APELLIDO}-${ENV}"
                   LB_IP=""
                   MAX_RETRIES=5
                   RETRY_COUNT=0
-        
+
                   while [ -z "$LB_IP" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
                     LB_IP=$(kubectl get svc $SERVICE_NAME -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
                     if [ -z "$LB_IP" ]; then
@@ -143,12 +138,138 @@ pipeline {
                       sleep 5
                     fi
                   done
-        
+
                   if [ -z "$LB_IP" ]; then
-                    echo ">>> No se pudo obtener la IP del LoadBalancer después de $MAX_RETRIES intentos."
+                    echo ">>> No se pudo obtener la IP del LoadBalancer tras $MAX_RETRIES intentos."
                     exit 1
                   else
-                    echo ">>> IP del LoadBalancer asignada: $LB_IP"
+                    echo ">>> IP del servicio DEV: $LB_IP"
+                  fi
+                '''
+            }
+        }
+
+        // ─── APROBACIÓN QA ──────────────────────────────────────────────────────
+
+        stage('Aprobación QA') {
+            steps {
+                input message: '¿Aprobar despliegue a QA?', ok: 'Aprobar'
+            }
+        }
+
+        // ─── QA ─────────────────────────────────────────────────────────────────
+
+        stage('[CD-QA] Deploy a AKS') {
+            steps {
+                script {
+                    env.API_PROVIDER_URL = "https://qa.api.com"
+                    env.ENV = "qa"
+                }
+                sh '''
+                  echo ">>> Obteniendo credenciales de AKS QA..."
+                  az aks get-credentials \
+                    --resource-group $RESOURCE_GROUP \
+                    --name $AKS_NAME_QA \
+                    --overwrite-existing
+
+                  echo ">>> Renderizando manifiesto para QA..."
+                  envsubst < k8s.yml > k8s-qa.yml
+
+                  echo ">>> Desplegando en AKS QA..."
+                  az aks command invoke \
+                    --resource-group $RESOURCE_GROUP \
+                    --name $AKS_NAME_QA \
+                    --command "kubectl apply -f k8s-qa.yml" \
+                    --file k8s-qa.yml
+                '''
+            }
+        }
+
+        stage('[CD-QA] Imprimir IP del servicio') {
+            steps {
+                sh '''
+                  SERVICE_NAME="my-nodejs-service-${APELLIDO}-${ENV}"
+                  LB_IP=""
+                  MAX_RETRIES=5
+                  RETRY_COUNT=0
+
+                  while [ -z "$LB_IP" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+                    LB_IP=$(kubectl get svc $SERVICE_NAME -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+                    if [ -z "$LB_IP" ]; then
+                      RETRY_COUNT=$((RETRY_COUNT+1))
+                      echo "Intento $RETRY_COUNT/$MAX_RETRIES: IP aún no asignada, esperando 5s..."
+                      sleep 5
+                    fi
+                  done
+
+                  if [ -z "$LB_IP" ]; then
+                    echo ">>> No se pudo obtener la IP del LoadBalancer tras $MAX_RETRIES intentos."
+                    exit 1
+                  else
+                    echo ">>> IP del servicio QA: $LB_IP"
+                  fi
+                '''
+            }
+        }
+
+        // ─── APROBACIÓN PRD ─────────────────────────────────────────────────────
+
+        stage('Aprobación PRD') {
+            steps {
+                input message: '¿Aprobar despliegue a PRD?', ok: 'Aprobar'
+            }
+        }
+
+        // ─── PRD ─────────────────────────────────────────────────────────────────
+
+        stage('[CD-PRD] Deploy a AKS') {
+            steps {
+                script {
+                    env.API_PROVIDER_URL = "https://prd.api.com"
+                    env.ENV = "prd"
+                }
+                sh '''
+                  echo ">>> Obteniendo credenciales de AKS PRD..."
+                  az aks get-credentials \
+                    --resource-group $RESOURCE_GROUP \
+                    --name $AKS_NAME_PRD \
+                    --overwrite-existing
+
+                  echo ">>> Renderizando manifiesto para PRD..."
+                  envsubst < k8s.yml > k8s-prd.yml
+
+                  echo ">>> Desplegando en AKS PRD..."
+                  az aks command invoke \
+                    --resource-group $RESOURCE_GROUP \
+                    --name $AKS_NAME_PRD \
+                    --command "kubectl apply -f k8s-prd.yml" \
+                    --file k8s-prd.yml
+                '''
+            }
+        }
+
+        stage('[CD-PRD] Imprimir IP del servicio') {
+            steps {
+                sh '''
+                  SERVICE_NAME="my-nodejs-service-${APELLIDO}-${ENV}"
+                  LB_IP=""
+                  MAX_RETRIES=5
+                  RETRY_COUNT=0
+
+                  while [ -z "$LB_IP" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+                    LB_IP=$(kubectl get svc $SERVICE_NAME -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+                    if [ -z "$LB_IP" ]; then
+                      RETRY_COUNT=$((RETRY_COUNT+1))
+                      echo "Intento $RETRY_COUNT/$MAX_RETRIES: IP aún no asignada, esperando 5s..."
+                      sleep 5
+                    fi
+                  done
+
+                  if [ -z "$LB_IP" ]; then
+                    echo ">>> No se pudo obtener la IP del LoadBalancer tras $MAX_RETRIES intentos."
+                    exit 1
+                  else
+                    echo ">>> IP del servicio PRD: $LB_IP"
                   fi
                 '''
             }
